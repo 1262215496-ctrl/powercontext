@@ -32,6 +32,7 @@ from powercontext.artifacts import Artifact, ArtifactRef
 from powercontext.builtin.artifacts.memory import MemoryCitation, MemoryEntryVersion, MemoryService
 from powercontext.builtin.persistence.artifacts import ArtifactRepository
 from powercontext.builtin.persistence.cursor_codec import SignedCursorCodec
+from powercontext.builtin.persistence.cursors import SourceCursorRepository
 from powercontext.builtin.persistence.database import AsyncDatabase
 from powercontext.builtin.persistence.errors import (
     RepositoryNotFoundError,
@@ -218,6 +219,31 @@ class RelationalRecordService:
         except StoredPayloadConflictError as error:
             raise BaseValueConflictError("source", (scope_id, source_type, source.name)) from error
         return _source_record(scope_id, stored)
+
+    async def journal_scopes(self) -> tuple[str, ...]:
+        """Return every Scope that owns at least one persisted Source journal entry."""
+
+        async with self._database.transaction() as connection:
+            rows = await connection.execute(
+                select(SOURCE_JOURNAL_HEADS_TABLE.c.scope_id).where(SOURCE_JOURNAL_HEADS_TABLE.c.position > 0)
+            )
+            return tuple(str(row[0]) for row in rows)
+
+    async def source_pending(self, scope_id: str, binding_name: str, /) -> tuple[int, bool]:
+        """Return unprocessed Source identities and whether an accepted wave is in flight."""
+
+        async with self._database.transaction() as connection:
+            head = await self._sources.journal_position(connection, scope_id)
+            cursor = await SourceCursorRepository().load(connection, scope_id, binding_name)
+            pending = (
+                None
+                if self._processing_pending is None
+                else await self._processing_pending.load(connection, scope_id, binding_name)
+            )
+        committed = 0 if cursor is None else cursor.cursor.sequence
+        accepted = head if pending is None else max(head, pending.source_through)
+        in_flight = pending is not None and pending.flush_generation > pending.handled_flush_generation
+        return max(0, accepted - committed), in_flight
 
     async def get_source(self, scope_id: str, source_type: str, source_id: str, /) -> SourceRecord:
         self._require_content_source(source_type)

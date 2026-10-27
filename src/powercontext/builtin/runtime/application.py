@@ -108,6 +108,7 @@ from powercontext.builtin.artifacts.skill.publication import (
     ManagedSkillPublicationStatus,
 )
 from powercontext.builtin.artifacts.skill.registry import ExternalSkillRegistryService
+from powercontext.builtin.triggers.source_window import SOURCE_WINDOW_TRIGGER_NAME
 from powercontext.builtin.artifacts.topic_memory import (
     MAX_TOPIC_MEMORY_QUERY_LENGTH,
     MAX_TOPIC_MEMORY_QUERY_TERMS,
@@ -490,6 +491,7 @@ class ScopedSourceApplication:
                             span.set_attributes({_MEMORY_CAPTURE_SOURCE_COUNT: 1})
             except BaseValueConflictError as error:
                 raise SourceConflictError("identity", error.identity) from None
+            self._runtime._note_captured_source(self.scope_id)
             return SourceReceipt(
                 source_ref=SourceRef(source_type=record.source_type, source_id=record.source_id),
                 sequence=record.position,
@@ -506,6 +508,7 @@ class ScopedSourceApplication:
                 )
                 if span is not None:
                     span.set_attributes({_MEMORY_CAPTURE_SOURCE_COUNT: 1})
+            self._runtime._note_captured_source(self.scope_id)
             return SourceReceipt(source_ref=context.sources.catalog.as_ref(source), sequence=sequence)
 
 
@@ -533,11 +536,13 @@ class ScopedRecordApplication:
         /,
     ) -> SourceRecord:
         async with self._runtime._scope_operation(self.scope_id), self._runtime._locked(self.scope_id):
-            return await self._runtime._records().create_source(
+            created = await self._runtime._records().create_source(
                 self.scope_id,
                 source_type,
                 content,
             )
+        self._runtime._note_captured_source(self.scope_id)
+        return created
 
     async def get_source(self, source_type: str, source_id: str, /) -> SourceRecord:
         async with self._runtime._scope_operation(self.scope_id):
@@ -565,7 +570,9 @@ class ScopedRecordApplication:
         /,
     ) -> ArtifactCreated:
         async with self._runtime._scope_operation(self.scope_id), self._runtime._locked(self.scope_id):
-            return await self._runtime._records().create_artifact(self.scope_id, family, write)
+            created = await self._runtime._records().create_artifact(self.scope_id, family, write)
+        self._runtime._note_captured_source(self.scope_id)
+        return created
 
     async def get_artifact(self, family: str, artifact_id: str, /) -> ArtifactRecord:
         async with self._runtime._scope_operation(self.scope_id):
@@ -2998,6 +3005,8 @@ class BuiltinRuntime:
         capabilities: RuntimeCapabilities,
         code_service: CodeService | None = None,
         source_window_limit: int = 100,
+        memory_source_count_threshold: int | None = None,
+        topic_memory_source_count_threshold: int | None = None,
         context_assembly_max_entries: int = 8,
         recall_sufficiency_policy: RecallSufficiencyPolicy | None = None,
         scope_cache_size: int = DEFAULT_SCOPE_CACHE_SIZE,
@@ -3049,6 +3058,10 @@ class BuiltinRuntime:
     ) -> None:
         if source_window_limit < 1:
             raise _RuntimeConfigurationError("source_window_limit")
+        if memory_source_count_threshold is not None and memory_source_count_threshold < 1:
+            raise _RuntimeConfigurationError("memory_source_count_threshold")
+        if topic_memory_source_count_threshold is not None and topic_memory_source_count_threshold < 1:
+            raise _RuntimeConfigurationError("topic_memory_source_count_threshold")
         if context_assembly_max_entries < 1:
             raise _RuntimeConfigurationError("context_assembly_max_entries")
         if scope_cache_size < 1:
@@ -3102,6 +3115,8 @@ class BuiltinRuntime:
         self._scheduled_source_runner = scheduled_source_runner
         self._scheduled_experience_runner = scheduled_experience_runner
         self.source_window_limit = source_window_limit
+        self.memory_source_count_threshold = memory_source_count_threshold
+        self.topic_memory_source_count_threshold = topic_memory_source_count_threshold
         self.context_assembly_max_entries = context_assembly_max_entries
         self.recall_sufficiency_policy = recall_sufficiency_policy
         self._scope_cache = ScopeCache(
@@ -3110,6 +3125,9 @@ class BuiltinRuntime:
             observer=scope_cache_observer,
         )
         self._processor_lock = asyncio.Lock()
+        self._count_tasks: dict[tuple[str, str], asyncio.Task[None]] = {}
+        self._count_attempts: dict[tuple[str, str], int] = {}
+        self._count_sweep_task: asyncio.Task[None] | None = None
         self._close_lock = asyncio.Lock()
         self._lifecycle = asyncio.Condition()
         self._active_operations = 0
@@ -3286,6 +3304,8 @@ class BuiltinRuntime:
                 self._scheduler.pause()
             async with self._lifecycle:
                 self._closing = True
+            await self._cancel_count_checks()
+            async with self._lifecycle:
                 await self._lifecycle.wait_for(lambda: self._active_operations == 0)
             if self.artifact_processing_supervisor is not None:
                 await self.artifact_processing_supervisor.close()
@@ -3489,6 +3509,122 @@ class BuiltinRuntime:
         if self._record_service is None:
             raise _RuntimeStateError("records")
         return self._record_service
+
+    def _count_threshold(self, binding_name: str) -> int | None:
+        if binding_name == SOURCE_WINDOW_TRIGGER_NAME:
+            return self.memory_source_count_threshold
+        if binding_name == TOPIC_MEMORY_SOURCE_WINDOW_BINDING:
+            return self.topic_memory_source_count_threshold
+        return None
+
+    def start_source_count_supervision(self) -> None:
+        """Resume count-gated processing for work persisted before this runtime opened."""
+
+        if self.memory_source_count_threshold is None and self.topic_memory_source_count_threshold is None:
+            return
+        if self._count_sweep_task is not None:
+            return
+        self._count_sweep_task = asyncio.get_running_loop().create_task(
+            self._count_sweep(), name="powercontext.source-count-sweep"
+        )
+
+    async def _count_sweep(self) -> None:
+        try:
+            scopes = await self._records().journal_scopes()
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # noqa: BLE001 - supervision must never fail the runtime
+            log_safely(
+                logger,
+                logging.WARNING,
+                "Source count supervision could not inspect persisted Scopes",
+                exc_info=error,
+                extra={"event": "source_count.sweep.failed", "outcome": "failure", "unit": "source"},
+            )
+            return
+        for scope_id in scopes:
+            if self._closing:
+                return
+            if self.memory_source_count_threshold is not None:
+                self._schedule_count_check(scope_id, SOURCE_WINDOW_TRIGGER_NAME)
+            if self.topic_memory_source_count_threshold is not None:
+                self._schedule_count_check(scope_id, TOPIC_MEMORY_SOURCE_WINDOW_BINDING)
+
+    def _note_captured_source(self, scope_id: str) -> None:
+        """Re-evaluate count admission for a Scope that just accepted a Source identity."""
+
+        if self._closing:
+            return
+        if self.memory_source_count_threshold is not None:
+            self._schedule_count_check(scope_id, SOURCE_WINDOW_TRIGGER_NAME)
+        if self.topic_memory_source_count_threshold is not None:
+            self._schedule_count_check(scope_id, TOPIC_MEMORY_SOURCE_WINDOW_BINDING)
+
+    def _schedule_count_check(self, scope_id: str, binding_name: str, /, *, delay: float = 0.0) -> None:
+        key = (scope_id, binding_name)
+        if key in self._count_tasks:
+            return
+        task = asyncio.get_running_loop().create_task(
+            self._count_check(scope_id, binding_name, delay),
+            name=f"powercontext.source-count:{binding_name}:{scope_id}",
+        )
+        self._count_tasks[key] = task
+
+        def _finished(done: asyncio.Task[None]) -> None:
+            if self._count_tasks.get(key) is done:
+                self._count_tasks.pop(key, None)
+
+        task.add_done_callback(_finished)
+
+    async def _count_check(self, scope_id: str, binding_name: str, delay: float, /) -> None:
+        key = (scope_id, binding_name)
+        threshold = self._count_threshold(binding_name)
+        if threshold is None:
+            return
+        try:
+            if delay > 0:
+                await asyncio.sleep(delay)
+            while not self._closing:
+                pending, in_flight = await self._records().source_pending(scope_id, binding_name)
+                if pending < threshold:
+                    self._count_attempts.pop(key, None)
+                    return
+                if binding_name == TOPIC_MEMORY_SOURCE_WINDOW_BINDING:
+                    if in_flight:
+                        return
+                    await self.topic_memory.for_scope(scope_id).flush()
+                    self._count_attempts.pop(key, None)
+                    return
+                await self.memory.for_scope(scope_id).flush()
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # noqa: BLE001 - failed work keeps its cursor and retries
+            attempts = self._count_attempts.get(key, 0) + 1
+            self._count_attempts[key] = attempts
+            backoff = min(5.0, 0.25 * (2 ** min(attempts, 5)))
+            log_safely(
+                logger,
+                logging.WARNING,
+                "Count-gated Source processing failed; the cursor is unchanged",
+                exc_info=error,
+                extra={"event": "source_count.processing.failed", "outcome": "failure", "unit": "source"},
+            )
+            self._count_tasks.pop(key, None)
+            if not self._closing:
+                self._schedule_count_check(scope_id, binding_name, delay=backoff)
+
+    async def _cancel_count_checks(self) -> None:
+        tasks = list(self._count_tasks.values())
+        self._count_tasks.clear()
+        self._count_attempts.clear()
+        sweep = self._count_sweep_task
+        self._count_sweep_task = None
+        if sweep is not None:
+            tasks.append(sweep)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     def _generation(self, scope_id: str) -> ReviewedGenerationService:
         if self._generation_service is None:
