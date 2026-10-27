@@ -20,7 +20,7 @@ import json
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from itertools import chain
-from typing import TypeVar
+from typing import TYPE_CHECKING, TypeVar
 
 from powercontext.artifacts import ArtifactAddress, ArtifactRef
 from powercontext.builtin.artifacts.experience import Experience, ExperienceSearchHit, render_experience
@@ -41,6 +41,9 @@ from powercontext.builtin.runtime.prepared_text import (
     render_context_text,
 )
 from powercontext.builtin.runtime.recall_sufficiency import RecallBudgetView
+
+if TYPE_CHECKING:
+    from powercontext.builtin.runtime.evidence_fragments import PreparedContextFragment
 
 _MIN_TRUNCATED_CONTENT_BYTES = 64
 _ELLIPSIS = "…"
@@ -106,6 +109,7 @@ class PreparedContextBuild:
     origins: tuple[PreparedContextOrigin, ...]
     omissions: PreparedContextOmissions = PreparedContextOmissions()
     code_origins: tuple[CodeEvidenceRef, ...] = ()
+    fragments: tuple[PreparedContextFragment, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -234,6 +238,26 @@ class PreparedContextBuilder:
             raise PreparedContextInvariantError("topic-memory-candidate-limit")
         if sum(len(candidates.hits) for candidates in experience_candidates) > self.experience_candidate_limit:
             raise PreparedContextInvariantError("experience-candidate-limit")
+
+        if request.evidence_selection:
+            from powercontext.builtin.runtime.evidence_fragments import select_evidence_fragments
+
+            fragments, selected_content, selected_origins = select_evidence_fragments(
+                query=request.query,
+                memory_candidates=memory_candidates,
+                max_bytes=request.max_bytes,
+            )
+            if not fragments or selected_content is None:
+                return PreparedContextBuild(context=self.empty(), origins=())
+            return PreparedContextBuild(
+                context=PreparedContext(
+                    status="ready",
+                    content=selected_content,
+                    content_bytes=len(selected_content.encode("utf-8")),
+                ),
+                origins=selected_origins,
+                fragments=fragments,
+            )
 
         content, origins, omissions = self._select_entries(
             request=request,
