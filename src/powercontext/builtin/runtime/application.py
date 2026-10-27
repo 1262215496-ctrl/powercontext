@@ -248,6 +248,7 @@ from powercontext.builtin.runtime.recall_sufficiency import (
     build_recall_candidates,
     recall_effort,
 )
+from powercontext.builtin.runtime.source_lifecycle import SourceLifecycleApplication
 from powercontext.builtin.runtime.statistics import RelationalScopedStatistics, overview_selection
 from powercontext.builtin.scope import ScopeApplication, ScopeDescriptor, ScopeSelection
 from powercontext.builtin.scope.subject_sources import SubjectSourceService
@@ -1466,6 +1467,7 @@ class ScopedContextApplication:
                     )
                 )
             )
+            result = await self._runtime.filter_topic_hits(self.scope_id, result)
             if span is not None:
                 span.set_attributes({"powercontext.topic_memory.search.result_count": len(result.hits)})
             return TopicMemoryRecallOutcome(
@@ -2683,7 +2685,7 @@ class ScopedTopicMemoryApplication:
                         "unit": "topic-memory",
                     },
                 )
-        return result
+        return await self._runtime.filter_topic_hits(self.scope_id, result)
 
     async def _search_with_embedding(
         self,
@@ -3397,6 +3399,44 @@ class BuiltinRuntime:
         finally:
             if acquired:
                 lock.release()
+
+    @property
+    def lifecycle(self) -> SourceLifecycleApplication:
+        """Expose Source lifecycle registration for one scope."""
+
+        return SourceLifecycleApplication(self)
+
+    @asynccontextmanager
+    async def locked_scope(self, scope_id: str) -> AsyncIterator[None]:
+        """Serialize lifecycle state changes for one scope."""
+
+        async with self._scoped_operation(scope_id), self._locked(scope_id):
+            yield
+
+    @asynccontextmanager
+    async def context_for(
+        self,
+        scope_id: str,
+    ) -> AsyncIterator[PowerContext[BuiltinSources, BuiltinArtifacts, BuiltinTriggers]]:
+        """Open the scope context a lifecycle operation reads through."""
+
+        async with self._context(scope_id) as context:
+            yield context
+
+    async def filter_topic_hits(
+        self,
+        scope_id: str,
+        result: TopicMemorySearchResult,
+    ) -> TopicMemorySearchResult:
+        """Hide Topic Memory entries whose supporting Source is withdrawn."""
+
+        suppressed = await self.lifecycle.for_scope(scope_id).suppressed_topic_ids()
+        if not suppressed:
+            return result
+        hits = tuple(hit for hit in result.hits if str(hit.artifact_ref.artifact_id) not in suppressed)
+        if len(hits) == len(result.hits):
+            return result
+        return result.model_copy(update={"hits": hits})
 
     def _stage(
         self,
